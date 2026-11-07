@@ -1,57 +1,100 @@
-import os
-import pygame
+import json
+import re
 import sqlite3
-import isbnlib
+from contextlib import closing
+from http.client import HTTPException
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-pygame.init()
-pygame.mixer.init()
 
-con = sqlite3.connect("isbn.db")
-cur = con.cursor()
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def scan(lib_error):
+
+def play_duplicate_alert():
+	try:
+		import pygame
+	except ImportError:
+		return
+	try:
+		if not pygame.mixer.get_init():
+			pygame.mixer.init()
+		pygame.mixer.Sound(str(SCRIPT_DIR / "beeping_for_book_scanner.wav")).play()
+	except (pygame.error, OSError):
+		pass  # The printed alert still works without audio.
+
+
+def is_valid_isbn(isbn):
+	if re.fullmatch(r"[0-9]{9}[0-9X]", isbn):
+		check_digit = 10 if isbn[-1] == "X" else int(isbn[-1])
+		return (sum((10 - i) * int(digit) for i, digit in enumerate(isbn[:-1])) + check_digit) % 11 == 0
+	if re.fullmatch(r"97[89][0-9]{10}", isbn):
+		return sum((1, 3)[i % 2] * int(digit) for i, digit in enumerate(isbn)) % 10 == 0
+	return False
+
+
+def lookup_book(isbn):
+	query = urlencode({
+		"q": f"isbn:{isbn}",
+		"fields": "title,author_name,editions,editions.title",
+		"limit": 1,
+	})
+	request = Request(
+		f"https://openlibrary.org/search.json?{query}",
+		headers={"User-Agent": "library-cli (https://github.com/elgiad007/library-cli)"},
+	)
+	with urlopen(request, timeout=10) as response:
+		docs = json.load(response)["docs"]
+	if not isinstance(docs, list):
+		raise ValueError("Unexpected Open Library response")
+	if not docs:
+		return None
+
+	book = docs[0]
+	editions = book.get("editions", {}).get("docs", [])
+	title = editions[0].get("title") if editions else None
+	title = title or book.get("title")
+	if not isinstance(title, str) or not title.strip():
+		return None
+	authors = book.get("author_name") or []
+	if not isinstance(authors, list) or (authors and not isinstance(authors[0], str)):
+		raise ValueError("Unexpected author data from Open Library")
+	return title, authors[0] if authors else "NIL"
+
+
+def scan(con):
 	while True:
-		lib_error = False
-		
-		#scan_error = False
-		#is_scan = True
-		#os.system('clear')
-		repeat = False
-		
-		usr_input = input("scan or exit: ")
-		
+		usr_input = input("scan or exit: ").strip()
 		if usr_input.lower() == "exit":
-			is_scan = False
 			break
-		
-		res = cur.execute("SELECT isbn FROM books WHERE isbn = ?;", (usr_input,))
-		copys = res.fetchall()
-		
-		for copy in copys:
-			repeat = True
-			print("\nBook already added.\n")
-			alert = pygame.mixer.Sound("beeping_for_book_scanner.wav")
-			alert.play()
-			
-		if repeat == True:
-			continue
-		if len(usr_input) == 13 or len(usr_input) == 10:
-			book = isbnlib.meta(usr_input, service='openl')
-			cur.execute("INSERT INTO books values(?, ?, ?);", (usr_input, book["Title"], book["Authors"][0]))
-			con.commit()
-			#print(book
-			print(book["Title"], book["Authors"])
-		else:
-			print("ERROR: Invalid ISBN number. Please try again.")
 
-def main():
-	
-	lib_error = False
-	#scan_error = False
-	#is_scan = False
-	
-	#cur.execute("drop table if exists books;")
-	#cur.execute("CREATE TABLE books (isbn TEXT, title TEXT, author TEXT);")
+		isbn = usr_input.replace("-", "").replace(" ", "").upper()
+		if not is_valid_isbn(isbn):
+			print("ERROR: Invalid ISBN number. Please try again.")
+			continue
+
+		if con.execute("SELECT 1 FROM books WHERE isbn = ? COLLATE NOCASE;", (isbn,)).fetchone():
+			print("\nBook already added.\n")
+			play_duplicate_alert()
+			continue
+
+		try:
+			book = lookup_book(isbn)
+		except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError) as error:
+			print(f"ERROR: Open Library lookup failed ({error}). Try scanning again.")
+			continue
+		if book is None:
+			print(f"No book details found for ISBN {isbn}. You can add it with 'entermanually'.")
+			continue
+
+		title, author = book
+		with con:
+			con.execute("INSERT INTO books (isbn, title, author) VALUES (?, ?, ?);", (isbn, title, author))
+		print(f"{title}, {author}")
+
+
+def main(con):
+	cur = con.cursor()
 	
 	while True:
 		print("\n______________________________\nCommands:\n\n'scan'\n'entermanually'\n'search'\n'printall'\n'countall'\n'exit'\n\n")
@@ -59,14 +102,8 @@ def main():
 		usr_input = input("Type cmd: ")
 		
 		try:
-			#if scan_error == True:
-				#scan(scan_error=scan_error, is_scan=is_scan)
-				
-			if lib_error == True:
-				scan(lib_error=lib_error)
-			
 			if usr_input.lower() == "scan":
-				scan(lib_error=lib_error)
+				scan(con)
 			elif usr_input.lower() == "entermanually":
 				usr_input = input("Enter book title with correct caps: ")
 				
@@ -75,8 +112,7 @@ def main():
 				
 				for copy in copys:
 					print("\nBook already added.\n")
-					alert = pygame.mixer.Sound("beeping_for_book_scanner.wav")
-					alert.play()
+					play_duplicate_alert()
 					continue
 				book_title = usr_input
 				
@@ -153,12 +189,9 @@ def main():
 			else:
 				print("ERROR: Invalid Command. Please try again.")
 		except Exception as e:
-			#if is_scan:
-				#scan_error = True
-				#is_scan = False
-			if e == "Title":
-				lib_error = True
 			print(f"ERROR: {e}\nPlease consult your favorite child.")
 	
 if __name__ == "__main__":
-	main()
+	with closing(sqlite3.connect(SCRIPT_DIR / "isbn.db")) as con:
+		con.execute("CREATE TABLE IF NOT EXISTS books (isbn TEXT, title TEXT, author TEXT);")
+		main(con)
