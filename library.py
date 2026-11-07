@@ -62,134 +62,128 @@ def lookup_book(isbn):
 	return title, authors[0] if authors else "NIL"
 
 
+def book_label(title, author):
+	return f"{title} — {author if author and author != 'NIL' else 'Unknown author'}"
+
+
+def show_books(rows):
+	for isbn, title, author in rows:
+		print(f"{book_label(title, author)}")
+		if isbn and isbn != "NIL":
+			print(f"  ISBN: {isbn}")
+	print(f"{len(rows)} {'book' if len(rows) == 1 else 'books'} found.")
+
+
+def add_book(con, isbn="NIL"):
+	title = input("Title (or back): ").strip()
+	if title.lower() == "back":
+		return
+	if not title:
+		print("Title is required. Nothing added.")
+		return
+	author = input("Author (optional, or back): ").strip()
+	if author.lower() == "back":
+		return
+	author = author or "NIL"
+	duplicate = con.execute(
+		"SELECT isbn, title, author FROM books WHERE title = ? COLLATE NOCASE AND author = ? COLLATE NOCASE LIMIT 1;",
+		(title, author),
+	).fetchone()
+	if duplicate:
+		print(f"Already in library: {book_label(duplicate[1], duplicate[2])}")
+		play_duplicate_alert()
+		if input("Add another copy? [y/N]: ").strip().lower() != "y":
+			return
+	with con:
+		con.execute("INSERT INTO books (isbn, title, author) VALUES (?, ?, ?);", (isbn, title, author))
+	print(f"Added: {book_label(title, author)}")
+
+
 def scan(con):
+	print("Scan an ISBN, or type back.")
 	while True:
-		usr_input = input("scan or exit: ").strip()
-		if usr_input.lower() == "exit":
+		usr_input = input("scan> ").strip()
+		if usr_input.lower() == "back":
 			break
+		if not usr_input:
+			continue
 
 		isbn = usr_input.replace("-", "").replace(" ", "").upper()
 		if not is_valid_isbn(isbn):
-			print("ERROR: Invalid ISBN number. Please try again.")
+			print("Invalid ISBN. Check the number and try again.")
 			continue
 
-		if con.execute("SELECT 1 FROM books WHERE isbn = ? COLLATE NOCASE;", (isbn,)).fetchone():
-			print("\nBook already added.\n")
+		duplicate = con.execute("SELECT title, author FROM books WHERE isbn = ? COLLATE NOCASE LIMIT 1;", (isbn,)).fetchone()
+		if duplicate:
+			print(f"Already in library: {book_label(*duplicate)}")
 			play_duplicate_alert()
 			continue
 
+		print(f"Looking up {isbn}…")
 		try:
 			book = lookup_book(isbn)
-		except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError) as error:
-			print(f"ERROR: Open Library lookup failed ({error}). Try scanning again.")
+		except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError):
+			print("Could not reach Open Library. Try again, or use add to enter the book manually.")
 			continue
 		if book is None:
-			print(f"No book details found for ISBN {isbn}. You can add it with 'entermanually'.")
+			print(f"No book details found for ISBN {isbn}.")
+			if input("Add manually? [y/N]: ").strip().lower() == "y":
+				add_book(con, isbn)
 			continue
 
 		title, author = book
 		with con:
 			con.execute("INSERT INTO books (isbn, title, author) VALUES (?, ?, ?);", (isbn, title, author))
-		print(f"{title}, {author}")
+		print(f"Added: {book_label(title, author)}")
 
 
 def main(con):
-	cur = con.cursor()
-	
+	count = con.execute("SELECT COUNT(*) FROM books;").fetchone()[0]
+	print(f"Library · {count} {'book' if count == 1 else 'books'}")
+	print("Commands: scan, add, search, list, count, help, exit")
 	while True:
-		print("\n______________________________\nCommands:\n\n'scan'\n'entermanually'\n'search'\n'printall'\n'countall'\n'exit'\n\n")
-		
-		usr_input = input("Type cmd: ")
-		
+		usr_input = input("library> ").strip()
+		if not usr_input:
+			continue
+		command, _, argument = usr_input.partition(" ")
+		command = command.lower()
 		try:
-			if usr_input.lower() == "scan":
+			if command == "scan" and not argument.strip():
 				scan(con)
-			elif usr_input.lower() == "entermanually":
-				usr_input = input("Enter book title with correct caps: ")
-				
-				res = cur.execute("SELECT title FROM books WHERE title = ?;", (usr_input.lower(),))
-				copys = res.fetchall()
-				
-				for copy in copys:
-					print("\nBook already added.\n")
-					play_duplicate_alert()
+			elif command in ("add", "entermanually") and not argument.strip():
+				add_book(con)
+			elif command == "search":
+				query = argument.strip() or input("Search: ").strip()
+				if not query or query.lower() == "back":
 					continue
-				book_title = usr_input
-				
-				usr_input = input("\nNow enter book author with correct caps (if author not listed, press enter): ")
-				
-				if usr_input == "":
-					book_author = "NIL"
+				escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+				pattern = f"%{escaped}%"
+				rows = con.execute(
+					"SELECT isbn, title, author FROM books WHERE isbn LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' ORDER BY title COLLATE NOCASE, author COLLATE NOCASE;",
+					(pattern, pattern, pattern),
+				).fetchall()
+				if rows:
+					show_books(rows)
 				else:
-					book_author = usr_input
-					
-				cur.execute("INSERT INTO books values(?, ?, ?);", ('NIL', book_title, book_author))
-				con.commit()
-				#print(book
-				print(book_title, ",", book_author)
-			elif usr_input.lower() == "search":
-				usr_input = input("Do you want to search by isbn, book title, or book author?: ")
-				
-				if usr_input.lower() == "isbn":
-					usr_input = input("\nisbn: ")
-					res = cur.execute("SELECT * FROM books WHERE isbn = ?;", (usr_input,))
-					rows = res.fetchall()
-					
-					search_count = 0
-					for row in rows:
-						search_count += 1
-						print(row)
-						
-					if search_count == 0:
-						print("\nNo search results found.\n")
-				if usr_input.lower() == "book title" or usr_input.lower() == "title":
-					usr_input = input("\nbook title: ")
-					res = cur.execute("SELECT * FROM books WHERE title LIKE ?;", (f'%{usr_input}%',))
-					rows = res.fetchall()
-					
-					search_count = 0
-					for row in rows:
-						search_count += 1
-						print(row)
-						
-					if search_count == 0:
-						print("\nNo search results found.\n")
-				if usr_input.lower() == "author" or usr_input.lower() == "book author":
-					usr_input = input("\nbook author: ")
-					res = cur.execute("SELECT * FROM books WHERE author LIKE ?;", (f'%{usr_input}%',))
-					rows = res.fetchall()
-					
-					search_count = 0
-					for row in rows:
-						search_count += 1
-						print(row)
-						
-					if search_count == 0:
-						print("\nNo search results found.\n")
-			elif usr_input.lower() == "printall":
-				res = cur.execute("SELECT * FROM books;")
-				rows = res.fetchall()
-				
-				search_count = 0
-				for row in rows:
-					search_count += 1
-					print(row)
-				if search_count == 0:
-					print("\nNo search results found.\n")
-			elif usr_input.lower() == "countall":
-				res = cur.execute("SELECT * FROM books;")
-				rows = res.fetchall()
-				book_num = 0
-				
-				for row in rows:
-					book_num += 1
-				print("\nNumber of books scanned:\n\n",book_num)
-			elif usr_input.lower() == "exit":
-				break	
+					print(f'No books found for "{query}".')
+			elif command in ("list", "printall") and not argument.strip():
+				rows = con.execute("SELECT isbn, title, author FROM books ORDER BY title COLLATE NOCASE, author COLLATE NOCASE;").fetchall()
+				if rows:
+					show_books(rows)
+				else:
+					print("Library is empty. Use scan or add to start.")
+			elif command in ("count", "countall") and not argument.strip():
+				count = con.execute("SELECT COUNT(*) FROM books;").fetchone()[0]
+				print(f"{count} {'book' if count == 1 else 'books'}.")
+			elif command == "help" and not argument.strip():
+				print("Commands: scan, add, search <text>, list, count, help, exit")
+				print("In scan or add, type back to cancel or return.")
+			elif command == "exit" and not argument.strip():
+				break
 			else:
-				print("ERROR: Invalid Command. Please try again.")
-		except Exception as e:
-			print(f"ERROR: {e}\nPlease consult your favorite child.")
+				print(f'Unknown command: "{usr_input}". Type help for commands.')
+		except sqlite3.Error as error:
+			print(f"Catalog error: {error}")
 	
 if __name__ == "__main__":
 	with closing(sqlite3.connect(SCRIPT_DIR / "isbn.db")) as con:
